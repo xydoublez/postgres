@@ -12536,7 +12536,7 @@ CreateConversionStmt:
 /*****************************************************************************
  *
  *		QUERY:
- *				REPACK [ (options) ] [ <qualified_name> [ <name_list> ] [ USING INDEX <index_name> ] ]
+ *				REPACK [ CONCURRENTLY ] [ (options) ] [ <qualified_name> [ <name_list> ] [ USING INDEX <index_name> ] ]
  *
  *			obsolete variants:
  *				CLUSTER (options) [ <qualified_name> [ USING <index_name> ] ]
@@ -12546,37 +12546,46 @@ CreateConversionStmt:
  *****************************************************************************/
 
 RepackStmt:
-			REPACK opt_utility_option_list vacuum_relation USING INDEX name
+			REPACK opt_concurrently opt_utility_option_list vacuum_relation USING INDEX name
 				{
 					RepackStmt *n = makeNode(RepackStmt);
 
 					n->command = REPACK_COMMAND_REPACK;
-					n->relation = (VacuumRelation *) $3;
-					n->indexname = $6;
+					n->relation = (VacuumRelation *) $4;
+					n->indexname = $7;
 					n->usingindex = true;
-					n->params = $2;
+					n->params = $3;
+					if ($2)
+						n->params = lappend(n->params,
+											makeDefElem("concurrently", NULL, @2));
 					$$ = (Node *) n;
 				}
-			| REPACK opt_utility_option_list vacuum_relation opt_usingindex
+			| REPACK opt_concurrently opt_utility_option_list vacuum_relation opt_usingindex
 				{
 					RepackStmt *n = makeNode(RepackStmt);
 
 					n->command = REPACK_COMMAND_REPACK;
-					n->relation = (VacuumRelation *) $3;
+					n->relation = (VacuumRelation *) $4;
 					n->indexname = NULL;
-					n->usingindex = $4;
-					n->params = $2;
+					n->usingindex = $5;
+					n->params = $3;
+					if ($2)
+						n->params = lappend(n->params,
+											makeDefElem("concurrently", NULL, @2));
 					$$ = (Node *) n;
 				}
-			| REPACK opt_utility_option_list opt_usingindex
+			| REPACK opt_concurrently opt_utility_option_list opt_usingindex
 				{
 					RepackStmt *n = makeNode(RepackStmt);
 
 					n->command = REPACK_COMMAND_REPACK;
 					n->relation = NULL;
 					n->indexname = NULL;
-					n->usingindex = $3;
-					n->params = $2;
+					n->usingindex = $4;
+					n->params = $3;
+					if ($2)
+						n->params = lappend(n->params,
+											makeDefElem("concurrently", NULL, @2));
 					$$ = (Node *) n;
 				}
 			| CLUSTER '(' utility_option_list ')' qualified_name cluster_index_specification

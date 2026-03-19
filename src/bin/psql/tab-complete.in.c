@@ -5179,16 +5179,28 @@ match_previous_words(int pattern_id,
 /* REPACK */
 	else if (Matches("REPACK"))
 		COMPLETE_WITH_SCHEMA_QUERY_PLUS(Query_for_list_of_clusterables,
+										"(", "CONCURRENTLY", "USING INDEX");
+	else if (Matches("REPACK", "CONCURRENTLY"))
+		COMPLETE_WITH_SCHEMA_QUERY_PLUS(Query_for_list_of_clusterables,
 										"(", "USING INDEX");
 	else if (Matches("REPACK", "(*)"))
 		COMPLETE_WITH_SCHEMA_QUERY_PLUS(Query_for_list_of_clusterables,
 										"USING INDEX");
-	else if (Matches("REPACK", MatchAnyExcept("(")))
+	else if (Matches("REPACK", "CONCURRENTLY", "(*)"))
+		COMPLETE_WITH_SCHEMA_QUERY_PLUS(Query_for_list_of_clusterables,
+										"USING INDEX");
+	else if (Matches("REPACK", MatchAnyExcept("(", "CONCURRENTLY")))
+		COMPLETE_WITH("USING INDEX");
+	else if (Matches("REPACK", "CONCURRENTLY", MatchAnyExcept("(")))
 		COMPLETE_WITH("USING INDEX");
 	else if (Matches("REPACK", "(*)", MatchAnyExcept("(")))
 		COMPLETE_WITH("USING INDEX");
+	else if (Matches("REPACK", "CONCURRENTLY", "(*)", MatchAnyExcept("(")))
+		COMPLETE_WITH("USING INDEX");
 	else if (Matches("REPACK", MatchAny, "USING", "INDEX") ||
-			 Matches("REPACK", "(*)", MatchAny, "USING", "INDEX"))
+			 Matches("REPACK", "(*)", MatchAny, "USING", "INDEX") ||
+			 Matches("REPACK", "CONCURRENTLY", MatchAny, "USING", "INDEX") ||
+			 Matches("REPACK", "CONCURRENTLY", "(*)", MatchAny, "USING", "INDEX"))
 	{
 		set_completion_reference(prev3_wd);
 		COMPLETE_WITH_SCHEMA_QUERY(Query_for_index_of_table);

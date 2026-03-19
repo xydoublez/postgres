@@ -45,6 +45,7 @@
 #include "storage/lmgr.h"
 #include "storage/predicate.h"
 #include "utils/acl.h"
+#include "utils/datum.h"
 #include "utils/fmgroids.h"
 #include "utils/guc.h"
 #include "utils/inval.h"
@@ -54,6 +55,103 @@
 #include "utils/relmapper.h"
 #include "utils/snapmgr.h"
 #include "utils/syscache.h"
+
+/*
+ * REPACK and REPACK CONCURRENTLY — Architecture Overview
+ * =======================================================
+ *
+ * The REPACK command (and its predecessor CLUSTER) physically rewrites a
+ * table's heap file, optionally reordering rows according to an index.
+ * Two modes are available:
+ *
+ * 1. Standard REPACK (blocking)
+ * ------------------------------
+ * Acquires AccessExclusiveLock for the full duration.  No other session
+ * can read or write the table while REPACK runs.
+ *
+ *   ExecRepack
+ *     → process_single_relation      (acquire AccessExclusiveLock, resolve index)
+ *       → cluster_rel                (recheck permissions, call rebuild_relation)
+ *         → rebuild_relation         (make_new_heap → copy_table_data → finish_heap_swap)
+ *
+ * copy_table_data performs the actual heap rewrite: it opens the old heap
+ * (and optionally an index) via a TableScanDesc, writes rows into the new
+ * heap in sorted order using heap_insert(), and records the freeze XID and
+ * cutoff MultiXact for use during the file swap.
+ *
+ * finish_heap_swap swaps the physical file identifiers of the old and new
+ * heaps (via swap_relation_files), rebuilds all indexes on the old heap OID,
+ * and then drops the transient new heap.
+ *
+ *
+ * 2. REPACK CONCURRENTLY (non-blocking)
+ * --------------------------------------
+ * Minimises the exclusive-lock window so that DML (INSERT/UPDATE/DELETE) can
+ * proceed on the table during the slow copy phase.  The implementation is
+ * modeled on REINDEX CONCURRENTLY.
+ *
+ *   ExecRepack
+ *     → process_single_relation      (acquire ShareUpdateExclusiveLock, resolve index)
+ *       → repack_relation_concurrent (manages its own transaction lifecycle)
+ *
+ * repack_relation_concurrent uses a three-phase algorithm:
+ *
+ *   Phase 1  (ShareUpdateExclusiveLock)
+ *   ────────────────────────────────────
+ *   • make_new_heap creates a transient heap.
+ *   • copy_table_data copies all currently-visible rows into the new heap.
+ *   • phase1_snapshot_xmin = ReadNextTransactionId() is recorded immediately
+ *     before the copy begins.  Any row whose committed xmin ≥ this value was
+ *     inserted after Phase 1 started and will be handled in Phase 2.
+ *   • A session-level ShareUpdateExclusiveLock is taken on the old heap to
+ *     prevent it from being dropped across transaction boundaries.
+ *   • Phase 1's transaction is committed; DML has been running freely.
+ *
+ *   Wait phase
+ *   ──────────
+ *   • WaitForLockers blocks until all transactions that held any lock on the
+ *     old heap at the time Phase 1 committed have either committed or rolled
+ *     back.  This guarantees that no in-flight DML is still modifying the old
+ *     heap when we acquire AccessExclusiveLock in Phase 2.
+ *
+ *   Phase 2  (AccessExclusiveLock)
+ *   ────────────────────────────────
+ *   • Reopen the old heap with AccessExclusiveLock (blocks new DML).
+ *   • Apply the "delta" — changes to the old heap that occurred after Phase 1:
+ *       New inserts: scan old heap with current snapshot; any live row whose
+ *         committed xmin ≥ phase1_snapshot_xmin was inserted after Phase 1 and
+ *         is absent from the new heap → insert a copy into the new heap.
+ *       Phantom deletes: scan old heap with SnapshotAny; a row committed before
+ *         Phase 1 (xmin < phase1_snapshot_xmin) that has a committed deletion
+ *         (xmax ≥ phase1_snapshot_xmin) was copied into the new heap in Phase 1
+ *         but should no longer exist → find the matching row in the new heap by
+ *         attribute-wise equality (tuples_are_equal) and delete it.
+ *   • finish_heap_swap swaps heap files and rebuilds indexes, as in standard
+ *     REPACK.
+ *   • The session-level lock is released and a new transaction is started so
+ *     that the outer command loop can perform its own CommitTransactionCommand.
+ *
+ * Key helper functions
+ * ─────────────────────
+ *   make_new_heap          — creates an empty transient heap with identical
+ *                            schema, TOAST table, and storage options.
+ *   copy_table_data        — sequential/index scan + write to new heap; sets
+ *                            freeze XID and cutoff MultiXact values.
+ *   finish_heap_swap       — swaps file nodes, renames TOAST tables, rebuilds
+ *                            indexes, drops transient heap.
+ *   tuples_are_equal       — attribute-by-attribute equality check used for
+ *                            delta-reconciliation; handles NULLs and detoasts
+ *                            variable-length values before comparison.
+ *
+ * Restrictions on REPACK CONCURRENTLY
+ * ─────────────────────────────────────
+ *   • Must name a specific table (cannot repack all tables at once).
+ *   • Cannot run inside a transaction block.
+ *   • Not supported for CLUSTER or VACUUM FULL commands.
+ *   • Not supported with ANALYZE.
+ *   • Not supported on system catalogs, shared relations, temporary tables of
+ *     other sessions, or partitioned tables.
+ */
 
 /*
  * This struct is used to pass around the information on tables to be
@@ -84,6 +182,9 @@ static Relation process_single_relation(RepackStmt *stmt,
 static Oid	determine_clustered_index(Relation rel, bool usingindex,
 									  const char *indexname);
 static const char *RepackCommandAsString(RepackCommand cmd);
+static void repack_relation_concurrent(Oid tableOid, Oid indexOid,
+									   ClusterParams *params);
+static bool tuples_are_equal(TupleDesc tupdesc, HeapTuple tup1, HeapTuple tup2);
 
 
 /*
@@ -125,6 +226,8 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 		else if (strcmp(opt->defname, "analyze") == 0 ||
 				 strcmp(opt->defname, "analyse") == 0)
 			params.options |= defGetBoolean(opt) ? CLUOPT_ANALYZE : 0;
+		else if (strcmp(opt->defname, "concurrently") == 0)
+			params.options |= CLUOPT_CONCURRENT;
 		else
 			ereport(ERROR,
 					errcode(ERRCODE_SYNTAX_ERROR),
@@ -132,6 +235,42 @@ ExecRepack(ParseState *pstate, RepackStmt *stmt, bool isTopLevel)
 						   RepackCommandAsString(stmt->command),
 						   opt->defname),
 					parser_errposition(pstate, opt->location));
+	}
+
+	/* CONCURRENTLY has several restrictions */
+	if (params.options & CLUOPT_CONCURRENT)
+	{
+		/*
+		 * REPACK CONCURRENTLY is only supported for the REPACK command, not
+		 * for the legacy CLUSTER command or VACUUM FULL.
+		 */
+		if (stmt->command != REPACK_COMMAND_REPACK)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("CONCURRENTLY is not supported for %s",
+						   RepackCommandAsString(stmt->command)));
+
+		/*
+		 * CONCURRENTLY requires a specific relation to be named; repacking
+		 * all tables at once concurrently is not supported.
+		 */
+		if (stmt->relation == NULL)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("REPACK CONCURRENTLY requires a table name"));
+
+		/*
+		 * ANALYZE with CONCURRENTLY is not currently supported.
+		 */
+		if (params.options & CLUOPT_ANALYZE)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("REPACK CONCURRENTLY is not supported with ANALYZE"));
+
+		/*
+		 * CONCURRENTLY cannot run inside a transaction block.
+		 */
+		PreventInTransactionBlock(isTopLevel, "REPACK CONCURRENTLY");
 	}
 
 	/*
@@ -1880,6 +2019,7 @@ process_single_relation(RepackStmt *stmt, ClusterParams *params)
 {
 	Relation	rel;
 	Oid			tableOid;
+	LOCKMODE	lockmode;
 
 	Assert(stmt->relation != NULL);
 	Assert(stmt->command == REPACK_COMMAND_CLUSTER ||
@@ -1894,12 +2034,16 @@ process_single_relation(RepackStmt *stmt, ClusterParams *params)
 				errmsg("ANALYZE option must be specified when a column list is provided"));
 
 	/*
-	 * Find, lock, and check permissions on the table.  We obtain
+	 * In concurrent mode, we use ShareUpdateExclusiveLock to allow DML to
+	 * proceed during the initial copy phase.  In normal mode, we obtain
 	 * AccessExclusiveLock right away to avoid lock-upgrade hazard in the
 	 * single-transaction case.
 	 */
+	lockmode = (params->options & CLUOPT_CONCURRENT) ?
+		ShareUpdateExclusiveLock : AccessExclusiveLock;
+
 	tableOid = RangeVarGetRelidExtended(stmt->relation->relation,
-										AccessExclusiveLock,
+										lockmode,
 										0,
 										RangeVarCallbackMaintainsTable,
 										NULL);
@@ -1917,43 +2061,93 @@ process_single_relation(RepackStmt *stmt, ClusterParams *params)
 					   RepackCommandAsString(stmt->command)));
 
 	/*
-	 * For partitioned tables, let caller handle this.  Otherwise, process it
-	 * here and we're done.
+	 * CONCURRENTLY cannot be used on system catalogs or shared relations.
+	 */
+	if (params->options & CLUOPT_CONCURRENT)
+	{
+		if (IsCatalogRelation(rel))
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("REPACK CONCURRENTLY cannot be performed on system catalogs"));
+
+		if (rel->rd_rel->relisshared)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("REPACK CONCURRENTLY cannot be performed on shared relations"));
+
+		/*
+		 * Temporary tables cannot be repacked concurrently; they are
+		 * session-local and do not have the concurrency concerns that
+		 * CONCURRENTLY addresses.
+		 */
+		if (rel->rd_rel->relpersistence == RELPERSISTENCE_TEMP)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("REPACK CONCURRENTLY cannot be performed on temporary tables"));
+	}
+
+	/*
+	 * For partitioned tables, let caller handle this.  CONCURRENTLY is not
+	 * supported for partitioned tables.
 	 */
 	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
+	{
+		if (params->options & CLUOPT_CONCURRENT)
+			ereport(ERROR,
+					errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					errmsg("REPACK CONCURRENTLY cannot be performed on partitioned tables"),
+					errhint("Repack each partition individually."));
 		return rel;
+	}
 	else
 	{
 		Oid			indexOid;
 
 		indexOid = determine_clustered_index(rel, stmt->usingindex,
 											 stmt->indexname);
-		if (OidIsValid(indexOid))
-			check_index_is_clusterable(rel, indexOid, AccessExclusiveLock);
-		cluster_rel(stmt->command, rel, indexOid, params);
 
-		/*
-		 * Do an analyze, if requested.  We close the transaction and start a
-		 * new one, so that we don't hold the stronger lock for longer than
-		 * needed.
-		 */
-		if (params->options & CLUOPT_ANALYZE)
+		if (params->options & CLUOPT_CONCURRENT)
 		{
-			VacuumParams vac_params = {0};
+			/*
+			 * In concurrent mode, we handle the index validity check and then
+			 * dispatch to the concurrent repack path.  We close the relation
+			 * here since repack_relation_concurrent will manage its own
+			 * transaction lifecycle.
+			 */
+			if (OidIsValid(indexOid))
+				check_index_is_clusterable(rel, indexOid, ShareUpdateExclusiveLock);
+			table_close(rel, NoLock);
+			repack_relation_concurrent(tableOid, indexOid, params);
+		}
+		else
+		{
+			if (OidIsValid(indexOid))
+				check_index_is_clusterable(rel, indexOid, AccessExclusiveLock);
+			cluster_rel(stmt->command, rel, indexOid, params);
 
-			PopActiveSnapshot();
-			CommitTransactionCommand();
+			/*
+			 * Do an analyze, if requested.  We close the transaction and start a
+			 * new one, so that we don't hold the stronger lock for longer than
+			 * needed.
+			 */
+			if (params->options & CLUOPT_ANALYZE)
+			{
+				VacuumParams vac_params = {0};
 
-			StartTransactionCommand();
-			PushActiveSnapshot(GetTransactionSnapshot());
+				PopActiveSnapshot();
+				CommitTransactionCommand();
 
-			vac_params.options |= VACOPT_ANALYZE;
-			if (params->options & CLUOPT_VERBOSE)
-				vac_params.options |= VACOPT_VERBOSE;
-			analyze_rel(tableOid, NULL, vac_params,
-						stmt->relation->va_cols, true, NULL);
-			PopActiveSnapshot();
-			CommandCounterIncrement();
+				StartTransactionCommand();
+				PushActiveSnapshot(GetTransactionSnapshot());
+
+				vac_params.options |= VACOPT_ANALYZE;
+				if (params->options & CLUOPT_VERBOSE)
+					vac_params.options |= VACOPT_VERBOSE;
+				analyze_rel(tableOid, NULL, vac_params,
+							stmt->relation->va_cols, true, NULL);
+				PopActiveSnapshot();
+				CommandCounterIncrement();
+			}
 		}
 
 		return NULL;
@@ -2024,4 +2218,484 @@ RepackCommandAsString(RepackCommand cmd)
 			return "CLUSTER";
 	}
 	return "???";				/* keep compiler quiet */
+}
+
+/*
+ * tuples_are_equal
+ *
+ * Compare two heap tuples attribute by attribute for equality.  Dropped
+ * columns are skipped.  NULL values compare equal to NULL; a NULL and a
+ * non-NULL value compare unequal.
+ *
+ * For variable-length attributes, values are detoasted before comparison to
+ * correctly handle cases where one copy is stored out-of-line (TOAST pointer)
+ * and the other is stored inline — as can happen when comparing old-heap
+ * tuples (which may retain TOAST pointers) against Phase-1 new-heap tuples
+ * (which had large values inlined by copy_table_data).
+ *
+ * Uses datumIsEqual() for fixed-length attributes.
+ */
+static bool
+tuples_are_equal(TupleDesc tupdesc, HeapTuple tup1, HeapTuple tup2)
+{
+	for (int i = 0; i < tupdesc->natts; i++)
+	{
+		Form_pg_attribute attr = TupleDescAttr(tupdesc, i);
+		bool		isnull1,
+					isnull2;
+		Datum		d1,
+					d2;
+
+		/* Skip dropped columns */
+		if (attr->attisdropped)
+			continue;
+
+		d1 = heap_getattr(tup1, i + 1, tupdesc, &isnull1);
+		d2 = heap_getattr(tup2, i + 1, tupdesc, &isnull2);
+
+		if (isnull1 != isnull2)
+			return false;
+
+		if (isnull1)
+			continue;			/* both NULL, continue */
+
+		if (!attr->attbyval && attr->attlen == -1)
+		{
+			/*
+			 * Variable-length attribute: detoast both values before
+			 * comparing so that out-of-line TOAST pointers and inline data
+			 * for the same logical value compare as equal.
+			 */
+			Datum		d1d = PointerGetDatum(PG_DETOAST_DATUM(d1));
+			Datum		d2d = PointerGetDatum(PG_DETOAST_DATUM(d2));
+			bool		eq = datumIsEqual(d1d, d2d, false, attr->attlen);
+
+			if (DatumGetPointer(d1d) != DatumGetPointer(d1))
+				pfree(DatumGetPointer(d1d));
+			if (DatumGetPointer(d2d) != DatumGetPointer(d2))
+				pfree(DatumGetPointer(d2d));
+
+			if (!eq)
+				return false;
+		}
+		else
+		{
+			if (!datumIsEqual(d1, d2, attr->attbyval, attr->attlen))
+				return false;
+		}
+	}
+
+	return true;
+}
+
+/*
+ * repack_relation_concurrent
+ *
+ * Perform a REPACK CONCURRENTLY operation on a single table.  This function
+ * manages its own transaction lifecycle.
+ *
+ * The algorithm proceeds in three phases:
+ *
+ * Phase 1 (ShareUpdateExclusiveLock):
+ *   Create a new heap and copy all currently visible rows into it.  This
+ *   phase allows concurrent DML (INSERT/UPDATE/DELETE) to proceed on the
+ *   old table.  We record phase1_snapshot_xmin (the next XID at Phase 1
+ *   start) so we can later identify rows that changed after this point.
+ *
+ * Wait phase:
+ *   Wait for any transactions that hold conflicting locks on the old heap
+ *   to finish, ensuring that any DML concurrent with Phase 1 has committed
+ *   or rolled back before we acquire the exclusive lock in Phase 2.
+ *
+ * Phase 2 (AccessExclusiveLock):
+ *   Apply the delta: insert rows added after Phase 1's snapshot and delete
+ *   rows from the new heap that were removed from the old heap after Phase
+ *   1's snapshot.  Then swap the physical files of the old and new heaps
+ *   and rebuild indexes.
+ *
+ * Delta handling:
+ *   - New inserts (xmin >= phase1_snapshot_xmin, committed): copied to
+ *     new heap.
+ *   - Phantom deletes (row visible before Phase 1, committed xmax >=
+ *     phase1_snapshot_xmin): the corresponding row in new heap is found
+ *     via content-based matching and deleted.  This is O(deleted_rows *
+ *     new_heap_size) in the worst case; in practice, few rows change
+ *     between Phase 1 and Phase 2, so this is fast.
+ */
+static void
+repack_relation_concurrent(Oid tableOid, Oid indexOid, ClusterParams *params)
+{
+	Oid			OIDNewHeap;
+	Relation	OldHeap;
+	Relation	NewHeap;
+	Relation	index = NULL;
+	char		relpersistence;
+	bool		is_system_catalog;
+	bool		swap_toast_by_content;
+	TransactionId frozenXid;
+	MultiXactId cutoffMulti;
+	TransactionId phase1_snapshot_xmin;
+	bool		verbose = ((params->options & CLUOPT_VERBOSE) != 0);
+	int			elevel = verbose ? INFO : DEBUG2;
+	LOCKTAG		heaplocktag;
+	LockRelId	heaplockid;
+	MemoryContext private_context;
+	MemoryContext oldcontext;
+	Oid			accessMethod;
+	Oid			tableSpace;
+
+	/*
+	 * Create a memory context that will survive forced transaction commits we
+	 * do below.  Since it is a child of PortalContext, it will go away
+	 * eventually even if we suffer an error.
+	 */
+	private_context = AllocSetContextCreate(PortalContext,
+											"RepackConcurrent",
+											ALLOCSET_DEFAULT_SIZES);
+
+	/* -----------------------------------------------------------------------
+	 * Phase 1: Copy data with ShareUpdateExclusiveLock
+	 * -----------------------------------------------------------------------
+	 *
+	 * We open the relation with the lock already held (it was obtained in
+	 * process_single_relation).  Create the new heap and copy all rows that
+	 * are visible now.
+	 */
+
+	pgstat_progress_start_command(PROGRESS_COMMAND_REPACK, tableOid);
+	pgstat_progress_update_param(PROGRESS_REPACK_COMMAND, REPACK_COMMAND_REPACK);
+
+	OldHeap = table_open(tableOid, NoLock);
+
+	Assert(CheckRelationLockedByMe(OldHeap, ShareUpdateExclusiveLock, false));
+
+	/* Check for user-requested abort. */
+	CHECK_FOR_INTERRUPTS();
+
+	/*
+	 * Don't process temp tables of other backends.
+	 */
+	if (RELATION_IS_OTHER_TEMP(OldHeap))
+		ereport(ERROR,
+				errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				errmsg("cannot execute REPACK CONCURRENTLY on temporary tables of other sessions"));
+
+	/*
+	 * Quietly skip unpopulated materialized views -- no data to repack.
+	 */
+	if (OldHeap->rd_rel->relkind == RELKIND_MATVIEW &&
+		!RelationIsPopulated(OldHeap))
+	{
+		table_close(OldHeap, ShareUpdateExclusiveLock);
+		pgstat_progress_end_command();
+		MemoryContextDelete(private_context);
+		return;
+	}
+
+	Assert(OldHeap->rd_rel->relkind == RELKIND_RELATION ||
+		   OldHeap->rd_rel->relkind == RELKIND_MATVIEW);
+
+	/* Remember needed info before we start manipulating heaps */
+	relpersistence = OldHeap->rd_rel->relpersistence;
+	is_system_catalog = IsSystemRelation(OldHeap);
+	accessMethod = OldHeap->rd_rel->relam;
+	tableSpace = OldHeap->rd_rel->reltablespace;
+
+	/* Save lock information for the wait phase (in stable memory context) */
+	oldcontext = MemoryContextSwitchTo(private_context);
+	heaplockid = OldHeap->rd_lockInfo.lockRelId;
+	MemoryContextSwitchTo(oldcontext);
+	SET_LOCKTAG_RELATION(heaplocktag, heaplockid.dbId, heaplockid.relId);
+
+	/* Check heap and index are valid to cluster on */
+	if (OidIsValid(indexOid))
+	{
+		check_index_is_clusterable(OldHeap, indexOid, ShareUpdateExclusiveLock);
+		index = index_open(indexOid, NoLock);
+		/* mark the index as the one to use for clustering */
+		mark_index_clustered(OldHeap, indexOid, true);
+	}
+
+	ereport(elevel,
+			errmsg("repacking \"%s\" concurrently (Phase 1: copying data)",
+				   RelationGetRelationName(OldHeap)));
+
+	/*
+	 * Create the transient table that will receive the re-ordered data.
+	 *
+	 * OldHeap is already locked, so no need to lock it again.  make_new_heap
+	 * obtains AccessExclusiveLock on the new heap and its toast table.
+	 */
+	OIDNewHeap = make_new_heap(tableOid, tableSpace,
+							   accessMethod,
+							   relpersistence,
+							   NoLock);
+	Assert(CheckRelationOidLockedByMe(OIDNewHeap, AccessExclusiveLock, false));
+	NewHeap = table_open(OIDNewHeap, NoLock);
+
+	/*
+	 * Record the next XID before we begin the copy.  Any tuple with a
+	 * committed xmin >= phase1_snapshot_xmin was inserted after we started
+	 * and is thus not in the new heap.  Similarly, any committed deletion
+	 * with xmax >= phase1_snapshot_xmin must be reflected in Phase 2.
+	 */
+	phase1_snapshot_xmin = ReadNextTransactionId();
+
+	/* Copy the heap data into the new table in the desired order */
+	copy_table_data(NewHeap, OldHeap, index, verbose,
+					&swap_toast_by_content, &frozenXid, &cutoffMulti);
+
+	/* Close relcache entries, but keep lock until transaction commit */
+	table_close(OldHeap, NoLock);
+	if (index)
+		index_close(index, NoLock);
+	table_close(NewHeap, NoLock);
+
+	/*
+	 * Get a session-level lock on the heap relation to prevent it from
+	 * being dropped between transactions.
+	 */
+	LockRelationIdForSession(&heaplockid, ShareUpdateExclusiveLock);
+
+	/*
+	 * Commit Phase 1.  The ShareUpdateExclusiveLock is released here, but
+	 * the session-level lock remains so the relation cannot be dropped.
+	 */
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	/* -----------------------------------------------------------------------
+	 * Wait phase
+	 * -----------------------------------------------------------------------
+	 *
+	 * Wait until no running transaction holds a conflicting lock on the
+	 * old heap.  This ensures any DML that was concurrent with Phase 1 has
+	 * finished before we try to acquire AccessExclusiveLock in Phase 2.
+	 */
+	StartTransactionCommand();
+
+	ereport(elevel,
+			errmsg("repacking \"%s\" concurrently (waiting for concurrent transactions)",
+				   get_rel_name(tableOid)));
+
+	WaitForLockers(heaplocktag, ShareUpdateExclusiveLock, true);
+
+	CommitTransactionCommand();
+
+	/* -----------------------------------------------------------------------
+	 * Phase 2: Apply delta and swap with AccessExclusiveLock
+	 * -----------------------------------------------------------------------
+	 *
+	 * Acquire an exclusive lock to apply the delta (rows that changed after
+	 * Phase 1) and perform the file swap.  With AccessExclusiveLock held,
+	 * no concurrent DML can run, so the old heap reflects the final state.
+	 */
+	StartTransactionCommand();
+
+	OldHeap = try_table_open(tableOid, AccessExclusiveLock);
+	if (OldHeap == NULL)
+	{
+		/*
+		 * The table was dropped between Phase 1 and Phase 2.  Clean up and
+		 * return without error.
+		 */
+		ereport(WARNING,
+				errmsg("table \"%s\" was dropped before REPACK CONCURRENTLY could complete",
+					   get_rel_name(tableOid)));
+		UnlockRelationIdForSession(&heaplockid, ShareUpdateExclusiveLock);
+		pgstat_progress_end_command();
+		CommitTransactionCommand();
+		MemoryContextDelete(private_context);
+		return;
+	}
+
+	PushActiveSnapshot(GetTransactionSnapshot());
+
+	ereport(elevel,
+			errmsg("repacking \"%s\" concurrently (Phase 2: applying delta)",
+				   RelationGetRelationName(OldHeap)));
+
+	/* Reopen the new heap (Phase 1's copy) */
+	NewHeap = table_open(OIDNewHeap, AccessExclusiveLock);
+
+	/*
+	 * Apply the delta.
+	 *
+	 * Step 1: Insert rows that were added to the old heap after Phase 1.
+	 * These are live rows (visible to the current snapshot) whose xmin >=
+	 * phase1_snapshot_xmin.
+	 */
+	{
+		TableScanDesc scan;
+		HeapTuple	tuple;
+		Snapshot	snap = GetActiveSnapshot();
+
+		scan = table_beginscan(OldHeap, snap, 0, NULL);
+		while ((tuple = heap_getnext(scan, ForwardScanDirection)) != NULL)
+		{
+			TransactionId xmin = HeapTupleHeaderGetRawXmin(tuple->t_data);
+
+			/*
+			 * Only process normal XIDs.  FrozenTransactionId and other
+			 * special values are always "old" (before Phase 1).
+			 * TransactionIdFollowsOrEquals handles non-normal XIDs safely,
+			 * but being explicit makes the intent clearer.
+			 */
+			if (!TransactionIdIsNormal(xmin))
+				continue;
+
+			if (!TransactionIdFollowsOrEquals(xmin, phase1_snapshot_xmin))
+				continue;		/* row existed before Phase 1, already in new heap */
+
+			/* This row was inserted after Phase 1; copy it to the new heap */
+			{
+				HeapTuple	newTuple = heap_copytuple(tuple);
+
+				simple_heap_insert(NewHeap, newTuple);
+				heap_freetuple(newTuple);
+			}
+
+			CHECK_FOR_INTERRUPTS();
+		}
+		table_endscan(scan);
+	}
+
+	/*
+	 * Step 2: Remove rows from the new heap that were deleted from the old
+	 * heap after Phase 1.  These are rows that:
+	 *   (a) were committed before Phase 1 (their xmin < phase1_snapshot_xmin),
+	 *       so they appear in Phase 1's new heap copy, and
+	 *   (b) had a committed deletion (xmax >= phase1_snapshot_xmin) after
+	 *       Phase 1 started, so they should NOT be in the final heap.
+	 *
+	 * For each such "phantom deleted" row we scan the new heap to find the
+	 * corresponding row by content equality, then delete it.  This is
+	 * O(phantom_deletes * new_heap_size) but is fast in practice because
+	 * few rows change between Phase 1 and Phase 2.
+	 */
+	{
+		TableScanDesc oldscan;
+		HeapTuple	oldtuple;
+		TupleDesc	tupdesc = RelationGetDescr(OldHeap);
+
+		oldscan = table_beginscan(OldHeap, SnapshotAny, 0, NULL);
+		while ((oldtuple = heap_getnext(oldscan, ForwardScanDirection)) != NULL)
+		{
+			TransactionId xmin = HeapTupleHeaderGetRawXmin(oldtuple->t_data);
+			TransactionId xmax = HeapTupleHeaderGetRawXmax(oldtuple->t_data);
+
+			/*
+			 * Skip rows not committed before Phase 1:
+			 *   - Frozen XIDs (FrozenTransactionId / BootstrapTransactionId)
+			 *     are always "before Phase 1" and need no special check.
+			 *   - Normal XIDs >= phase1_snapshot_xmin were inserted after
+			 *     Phase 1 and are not in the new heap.
+			 *   - Non-committed XIDs: row was never inserted; skip.
+			 */
+			if (TransactionIdIsNormal(xmin))
+			{
+				if (TransactionIdFollowsOrEquals(xmin, phase1_snapshot_xmin))
+					continue;	/* inserted after Phase 1, not in new heap */
+				if (!TransactionIdDidCommit(xmin))
+					continue;	/* insertion was rolled back; skip */
+			}
+			else if (!TransactionIdIsValid(xmin))
+				continue;		/* invalid xmin; skip */
+			/* else: frozen/bootstrap XID, always committed before Phase 1 */
+
+			/*
+			 * Now check whether this row was deleted after Phase 1.
+			 */
+			if (!TransactionIdIsValid(xmax))
+				continue;		/* no deletion; row is still live */
+
+			if (!TransactionIdIsNormal(xmax))
+				continue;		/* special xmax value; skip */
+
+			if (!TransactionIdFollowsOrEquals(xmax, phase1_snapshot_xmin))
+				continue;		/* deleted before Phase 1; already absent from new heap */
+
+			if (!TransactionIdDidCommit(xmax))
+				continue;		/* deletion was rolled back; skip */
+
+			/*
+			 * This row was committed before Phase 1 (so it is in the new
+			 * heap) and was deleted after Phase 1 started.  Find and delete
+			 * the matching row in the new heap by content equality.
+			 */
+			{
+				TableScanDesc newscan;
+				HeapTuple	newtuple;
+				bool		found = false;
+
+				newscan = table_beginscan(NewHeap, SnapshotAny, 0, NULL);
+				while ((newtuple = heap_getnext(newscan, ForwardScanDirection)) != NULL)
+				{
+					/*
+					 * Skip already-deleted tuples in the new heap (those
+					 * with a valid xmax set by earlier iterations of this
+					 * loop).
+					 */
+					if (TransactionIdIsValid(
+							HeapTupleHeaderGetRawXmax(newtuple->t_data)))
+						continue;
+
+					if (tuples_are_equal(tupdesc, oldtuple, newtuple))
+					{
+						simple_heap_delete(NewHeap, &newtuple->t_self);
+						found = true;
+						break;
+					}
+				}
+				table_endscan(newscan);
+
+				if (!found)
+					ereport(DEBUG1,
+							errmsg("REPACK CONCURRENTLY: no matching row found in new heap for deleted tuple in \"%s\"",
+								   RelationGetRelationName(OldHeap)));
+			}
+
+			CHECK_FOR_INTERRUPTS();
+		}
+		table_endscan(oldscan);
+	}
+
+	/* Close relcache entries, but keep lock until transaction commit */
+	table_close(OldHeap, NoLock);
+	table_close(NewHeap, NoLock);
+
+	ereport(elevel,
+			errmsg("repacking \"%s\" concurrently (Phase 2: swapping relation files)",
+				   get_rel_name(tableOid)));
+
+	pgstat_progress_update_param(PROGRESS_REPACK_PHASE,
+								 PROGRESS_REPACK_PHASE_SWAP_REL_FILES);
+
+	/*
+	 * Swap the physical files of the old and new heaps, rebuild indexes,
+	 * and drop the transient new heap.
+	 */
+	finish_heap_swap(tableOid, OIDNewHeap, is_system_catalog,
+					 swap_toast_by_content, false, true,
+					 frozenXid, cutoffMulti,
+					 relpersistence);
+
+	PopActiveSnapshot();
+	CommitTransactionCommand();
+
+	/*
+	 * Release the session-level lock outside of any transaction, following
+	 * the same pattern as REINDEX CONCURRENTLY.
+	 */
+	UnlockRelationIdForSession(&heaplockid, ShareUpdateExclusiveLock);
+
+	/*
+	 * Start a new transaction so the outer command loop can complete it.
+	 * This matches the pattern used by REINDEX CONCURRENTLY.
+	 */
+	StartTransactionCommand();
+
+	pgstat_progress_end_command();
+
+	MemoryContextDelete(private_context);
 }

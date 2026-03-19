@@ -21,7 +21,7 @@ PostgreSQL documentation
 
  <refsynopsisdiv>
 <synopsis>
-REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <replaceable class="parameter">table_and_columns</replaceable> [ USING INDEX [ <replaceable class="parameter">index_name</replaceable> ] ] ]
+REPACK [ CONCURRENTLY ] [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] [ <replaceable class="parameter">table_and_columns</replaceable> [ USING INDEX [ <replaceable class="parameter">index_name</replaceable> ] ] ]
 REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] USING INDEX
 
 <phrase>where <replaceable class="parameter">option</replaceable> can be one of:</phrase>
@@ -68,6 +68,12 @@ REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] USING
    is acquired on it. This prevents any other database operations (both reads
    and writes) from operating on the table until the <command>REPACK</command>
    is finished.
+  </para>
+
+  <para>
+   The <literal>CONCURRENTLY</literal> option performs the repack using a
+   weaker lock so that writes (and reads) may proceed in parallel.  See
+   <xref linkend="sql-repack-concurrently"/> below.
   </para>
 
   <refsect2 id="sql-repack-notes-on-clustering" xreflabel="Notes on Clustering">
@@ -163,12 +169,124 @@ REPACK [ ( <replaceable class="parameter">option</replaceable> [, ...] ) ] USING
    </para>
   </refsect2>
 
+  <refsect2 id="sql-repack-concurrently" xreflabel="REPACK CONCURRENTLY">
+   <title>REPACK CONCURRENTLY</title>
+
+   <para>
+    The <literal>CONCURRENTLY</literal> option rewrites the table using a
+    weaker <literal>SHARE UPDATE EXCLUSIVE</literal> lock during the initial
+    copy phase, allowing concurrent <command>INSERT</command>,
+    <command>UPDATE</command>, and <command>DELETE</command> operations to
+    proceed on the table while the bulk of the work is done.  Only a brief
+    <literal>ACCESS EXCLUSIVE</literal> lock is needed at the end to apply
+    the delta and swap the physical files.
+   </para>
+
+   <para>
+    The algorithm proceeds in three phases:
+   </para>
+
+   <orderedlist>
+    <listitem>
+     <para>
+      <emphasis role="bold">Phase 1 &mdash; Copy
+      (<literal>SHARE UPDATE EXCLUSIVE</literal> lock):</emphasis>
+      A new heap is created and all currently-visible rows are copied into it
+      in the desired order.  Concurrent DML proceeds normally on the old heap.
+      The transaction XID watermark at the start of this phase
+      (<firstterm>phase1_snapshot_xmin</firstterm>) is recorded so that rows
+      changed after this point can be identified.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      <emphasis role="bold">Wait phase:</emphasis>
+      After committing Phase 1, the server waits for all transactions that
+      held any lock on the old heap to finish.  This ensures that any DML
+      concurrent with Phase 1 has either committed or rolled back before the
+      exclusive lock in Phase 2 is acquired.
+     </para>
+    </listitem>
+
+    <listitem>
+     <para>
+      <emphasis role="bold">Phase 2 &mdash; Apply delta and swap
+      (<literal>ACCESS EXCLUSIVE</literal> lock):</emphasis>
+      The delta — rows inserted or deleted after Phase 1 — is applied to the
+      new heap:
+      <itemizedlist>
+       <listitem>
+        <para>
+         <emphasis>New inserts</emphasis>: live rows in the old heap whose
+         committed <literal>xmin</literal> is at or after
+         <firstterm>phase1_snapshot_xmin</firstterm> were inserted after
+         Phase 1 and are absent from the new heap; they are copied in.
+        </para>
+       </listitem>
+       <listitem>
+        <para>
+         <emphasis>Phantom deletes</emphasis>: rows that were visible at
+         Phase 1 (copied into the new heap) but have since been deleted (their
+         committed <literal>xmax</literal> is at or after
+         <firstterm>phase1_snapshot_xmin</firstterm>) are found in the new
+         heap by attribute-wise equality and removed.
+        </para>
+       </listitem>
+      </itemizedlist>
+      Finally, the physical files of the old and new heaps are swapped and
+      all indexes are rebuilt on the old heap OID.
+     </para>
+    </listitem>
+   </orderedlist>
+
+   <para>
+    <literal>REPACK CONCURRENTLY</literal> has several restrictions:
+    <itemizedlist>
+     <listitem>
+      <para>A specific table name must be given; repacking all tables
+      concurrently is not supported.</para>
+     </listitem>
+     <listitem>
+      <para>It cannot be run inside a transaction block.</para>
+     </listitem>
+     <listitem>
+      <para>The <literal>ANALYZE</literal> option is not supported.</para>
+     </listitem>
+     <listitem>
+      <para>It cannot be run on system catalogs, shared relations, temporary
+      tables of other sessions, or partitioned tables.</para>
+     </listitem>
+    </itemizedlist>
+   </para>
+
+   <para>
+    Compared with standard <command>REPACK</command>, the concurrent form
+    requires additional disk space during Phase 1 (the new heap exists at the
+    same time as the old one) and a small amount of extra CPU work in Phase 2
+    to reconcile the delta.  In most cases the delta is tiny (very few rows
+    change between Phase 1 and Phase 2), so Phase 2 is fast.
+   </para>
+  </refsect2>
+
  </refsect1>
 
  <refsect1>
   <title>Parameters</title>
 
   <variablelist>
+   <varlistentry>
+    <term><literal>CONCURRENTLY</literal></term>
+    <listitem>
+     <para>
+      Perform the repack without holding <literal>ACCESS EXCLUSIVE</literal>
+      lock for the full duration.  DML operations on the table may proceed
+      concurrently during the initial copy phase.  See
+      <xref linkend="sql-repack-concurrently"/> for details and restrictions.
+     </para>
+    </listitem>
+   </varlistentry>
+
    <varlistentry>
     <term><replaceable class="parameter">table_name</replaceable></term>
     <listitem>
@@ -275,11 +393,27 @@ REPACK employees;
   </para>
 
   <para>
+   Repack the table <literal>employees</literal> without blocking concurrent
+   DML:
+<programlisting>
+REPACK CONCURRENTLY employees;
+</programlisting>
+  </para>
+
+  <para>
    Repack the table <literal>employees</literal> on the basis of its
    index <literal>employees_ind</literal> (Since index is used here, this is
    effectively clustering):
 <programlisting>
 REPACK employees USING INDEX employees_ind;
+</programlisting>
+  </para>
+
+  <para>
+   Repack and cluster the table <literal>employees</literal> concurrently,
+   reordering rows by <literal>employees_ind</literal>:
+<programlisting>
+REPACK CONCURRENTLY employees USING INDEX employees_ind;
 </programlisting>
   </para>
 

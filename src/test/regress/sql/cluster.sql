@@ -392,3 +392,48 @@ DROP TABLE clstr_4;
 DROP TABLE clstr_expression;
 
 DROP USER regress_clstr_user;
+
+-- Tests for REPACK CONCURRENTLY
+CREATE TABLE repack_conc_tst (a INT PRIMARY KEY, b TEXT);
+INSERT INTO repack_conc_tst SELECT i, 'value ' || i FROM generate_series(1, 100) i;
+
+-- Basic REPACK CONCURRENTLY
+REPACK CONCURRENTLY repack_conc_tst;
+
+-- Verify data is intact after REPACK CONCURRENTLY
+SELECT count(*) FROM repack_conc_tst;
+SELECT * FROM repack_conc_tst WHERE a = 1;
+SELECT * FROM repack_conc_tst WHERE a = 100;
+
+-- REPACK CONCURRENTLY with USING INDEX
+REPACK CONCURRENTLY repack_conc_tst USING INDEX repack_conc_tst_pkey;
+
+-- REPACK CONCURRENTLY cannot be run inside a transaction block
+BEGIN;
+REPACK CONCURRENTLY repack_conc_tst;
+END;
+
+-- REPACK CONCURRENTLY is not supported for the CLUSTER command
+CLUSTER CONCURRENTLY repack_conc_tst;
+
+-- REPACK CONCURRENTLY requires a table name
+REPACK CONCURRENTLY;
+
+-- REPACK CONCURRENTLY cannot be used with ANALYZE
+REPACK CONCURRENTLY (ANALYZE) repack_conc_tst;
+
+-- REPACK CONCURRENTLY cannot be run on system catalogs
+REPACK CONCURRENTLY pg_class;
+
+-- REPACK CONCURRENTLY cannot be run on partitioned tables
+CREATE TABLE repack_conc_part (a INT PRIMARY KEY, b TEXT)
+    PARTITION BY RANGE (a);
+CREATE TABLE repack_conc_part_1 PARTITION OF repack_conc_part
+    FOR VALUES FROM (1) TO (50);
+CREATE TABLE repack_conc_part_2 PARTITION OF repack_conc_part
+    FOR VALUES FROM (50) TO (100);
+REPACK CONCURRENTLY repack_conc_part;
+DROP TABLE repack_conc_part;
+
+-- Clean up
+DROP TABLE repack_conc_tst;
