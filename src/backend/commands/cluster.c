@@ -57,6 +57,103 @@
 #include "utils/syscache.h"
 
 /*
+ * REPACK and REPACK CONCURRENTLY — Architecture Overview
+ * =======================================================
+ *
+ * The REPACK command (and its predecessor CLUSTER) physically rewrites a
+ * table's heap file, optionally reordering rows according to an index.
+ * Two modes are available:
+ *
+ * 1. Standard REPACK (blocking)
+ * ------------------------------
+ * Acquires AccessExclusiveLock for the full duration.  No other session
+ * can read or write the table while REPACK runs.
+ *
+ *   ExecRepack
+ *     → process_single_relation      (acquire AccessExclusiveLock, resolve index)
+ *       → cluster_rel                (recheck permissions, call rebuild_relation)
+ *         → rebuild_relation         (make_new_heap → copy_table_data → finish_heap_swap)
+ *
+ * copy_table_data performs the actual heap rewrite: it opens the old heap
+ * (and optionally an index) via a TableScanDesc, writes rows into the new
+ * heap in sorted order using heap_insert(), and records the freeze XID and
+ * cutoff MultiXact for use during the file swap.
+ *
+ * finish_heap_swap swaps the physical file identifiers of the old and new
+ * heaps (via swap_relation_files), rebuilds all indexes on the old heap OID,
+ * and then drops the transient new heap.
+ *
+ *
+ * 2. REPACK CONCURRENTLY (non-blocking)
+ * --------------------------------------
+ * Minimises the exclusive-lock window so that DML (INSERT/UPDATE/DELETE) can
+ * proceed on the table during the slow copy phase.  The implementation is
+ * modeled on REINDEX CONCURRENTLY.
+ *
+ *   ExecRepack
+ *     → process_single_relation      (acquire ShareUpdateExclusiveLock, resolve index)
+ *       → repack_relation_concurrent (manages its own transaction lifecycle)
+ *
+ * repack_relation_concurrent uses a three-phase algorithm:
+ *
+ *   Phase 1  (ShareUpdateExclusiveLock)
+ *   ────────────────────────────────────
+ *   • make_new_heap creates a transient heap.
+ *   • copy_table_data copies all currently-visible rows into the new heap.
+ *   • phase1_snapshot_xmin = ReadNextTransactionId() is recorded immediately
+ *     before the copy begins.  Any row whose committed xmin ≥ this value was
+ *     inserted after Phase 1 started and will be handled in Phase 2.
+ *   • A session-level ShareUpdateExclusiveLock is taken on the old heap to
+ *     prevent it from being dropped across transaction boundaries.
+ *   • Phase 1's transaction is committed; DML has been running freely.
+ *
+ *   Wait phase
+ *   ──────────
+ *   • WaitForLockers blocks until all transactions that held any lock on the
+ *     old heap at the time Phase 1 committed have either committed or rolled
+ *     back.  This guarantees that no in-flight DML is still modifying the old
+ *     heap when we acquire AccessExclusiveLock in Phase 2.
+ *
+ *   Phase 2  (AccessExclusiveLock)
+ *   ────────────────────────────────
+ *   • Reopen the old heap with AccessExclusiveLock (blocks new DML).
+ *   • Apply the "delta" — changes to the old heap that occurred after Phase 1:
+ *       New inserts: scan old heap with current snapshot; any live row whose
+ *         committed xmin ≥ phase1_snapshot_xmin was inserted after Phase 1 and
+ *         is absent from the new heap → insert a copy into the new heap.
+ *       Phantom deletes: scan old heap with SnapshotAny; a row committed before
+ *         Phase 1 (xmin < phase1_snapshot_xmin) that has a committed deletion
+ *         (xmax ≥ phase1_snapshot_xmin) was copied into the new heap in Phase 1
+ *         but should no longer exist → find the matching row in the new heap by
+ *         attribute-wise equality (tuples_are_equal) and delete it.
+ *   • finish_heap_swap swaps heap files and rebuilds indexes, as in standard
+ *     REPACK.
+ *   • The session-level lock is released and a new transaction is started so
+ *     that the outer command loop can perform its own CommitTransactionCommand.
+ *
+ * Key helper functions
+ * ─────────────────────
+ *   make_new_heap          — creates an empty transient heap with identical
+ *                            schema, TOAST table, and storage options.
+ *   copy_table_data        — sequential/index scan + write to new heap; sets
+ *                            freeze XID and cutoff MultiXact values.
+ *   finish_heap_swap       — swaps file nodes, renames TOAST tables, rebuilds
+ *                            indexes, drops transient heap.
+ *   tuples_are_equal       — attribute-by-attribute equality check used for
+ *                            delta-reconciliation; handles NULLs and detoasts
+ *                            variable-length values before comparison.
+ *
+ * Restrictions on REPACK CONCURRENTLY
+ * ─────────────────────────────────────
+ *   • Must name a specific table (cannot repack all tables at once).
+ *   • Cannot run inside a transaction block.
+ *   • Not supported for CLUSTER or VACUUM FULL commands.
+ *   • Not supported with ANALYZE.
+ *   • Not supported on system catalogs, shared relations, temporary tables of
+ *     other sessions, or partitioned tables.
+ */
+
+/*
  * This struct is used to pass around the information on tables to be
  * clustered. We need this so we can make a list of them when invoked without
  * a specific table/index pair.
